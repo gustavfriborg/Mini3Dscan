@@ -1,0 +1,229 @@
+name: Build HouseCapture IPA
+
+# Unsigned build of Wes Bos's house-capture app for SideStore.
+# Source is checked out at a pinned commit; demo assets under data/ are not fetched.
+
+on:
+  push:
+    branches:
+      - main
+      - cursor/**
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Commit SHA of wesbos/3d-model-anything
+        required: false
+        default: 31b2dc9da3fb541e501f2f0936e55b32afb70ee8
+
+permissions:
+  contents: write
+
+concurrency:
+  group: house-capture-ipa-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: xcode-27
+    timeout-minutes: 45
+    env:
+      HOUSE_CAPTURE_REF: ${{ github.event.inputs.ref || '31b2dc9da3fb541e501f2f0936e55b32afb70ee8' }}
+    steps:
+      - name: Check out this repository
+        uses: actions/checkout@v7
+
+      - name: Check out house-capture at pinned commit
+        uses: actions/checkout@v7
+        with:
+          repository: wesbos/3d-model-anything
+          ref: ${{ env.HOUSE_CAPTURE_REF }}
+          path: upstream
+          persist-credentials: false
+          sparse-checkout: apps/house-capture
+          sparse-checkout-cone-mode: true
+
+      - name: Confirm pin and skip demo assets
+        run: |
+          set -euo pipefail
+          test "$(git -C upstream rev-parse HEAD)" = "$HOUSE_CAPTURE_REF"
+          test -f upstream/apps/house-capture/project.yml
+          test ! -e upstream/data
+          test ! -e upstream/docs/images
+
+      - name: Install XcodeGen
+        run: |
+          set -euo pipefail
+          curl -fsSL -o /tmp/xcodegen.zip "https://github.com/yonaskolb/XcodeGen/releases/download/2.46.0/xcodegen.zip"
+          rm -rf /tmp/xcodegen-dist
+          unzip -q /tmp/xcodegen.zip -d /tmp/xcodegen-dist
+          mkdir -p "$HOME/.local"
+          PREFIX="$HOME/.local" /tmp/xcodegen-dist/xcodegen/install.sh
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          "$HOME/.local/bin/xcodegen" --version
+
+      - name: Generate Xcode project
+        working-directory: upstream/apps/house-capture
+        run: |
+          set -euo pipefail
+          if ! grep -q '^schemes:' project.yml; then
+            cat >> project.yml <<'EOF'
+          schemes:
+            HouseCapture:
+              build:
+                targets:
+                  HouseCapture: all
+              run:
+                config: Debug
+              archive:
+                config: Release
+              management:
+                shared: true
+          EOF
+          fi
+          xcodegen generate
+          xcodebuild -project HouseCapture.xcodeproj -list
+
+      - name: Show toolchain
+        run: xcodebuild -version
+
+      - name: Build unsigned app
+        working-directory: upstream/apps/house-capture
+        run: |
+          set -euo pipefail
+          xcodebuild \
+            -project HouseCapture.xcodeproj \
+            -scheme HouseCapture \
+            -configuration Release \
+            -destination "generic/platform=iOS" \
+            -sdk iphoneos \
+            -derivedDataPath "$GITHUB_WORKSPACE/build" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGN_ENTITLEMENTS="" \
+            DEVELOPMENT_TEAM="" \
+            AD_HOC_CODE_SIGNING_ALLOWED=NO \
+            SUPPORTS_MACCATALYST=NO \
+            SUPPORTS_MAC_DESIGNED_FOR_IPHONE_IPAD=NO \
+            SUPPORTS_XR_DESIGNED_FOR_IPHONE_IPAD=NO \
+            VALIDATE_PRODUCT=NO \
+            build
+
+      - name: Package unsigned IPA
+        run: |
+          set -euo pipefail
+          APP="$(find "$GITHUB_WORKSPACE/build/Build/Products" -type d -name 'HouseCapture.app' -path '*iphoneos*' | head -1)"
+          test -n "$APP"
+          test -d "$APP"
+          test -x "$APP/HouseCapture"
+          echo "App: $APP"
+
+          rm -rf Payload HouseCapture.ipa
+          mkdir Payload
+          cp -a "$APP" Payload/
+
+          # Record any signature entitlements, then drop the signature so SideStore can re-sign.
+          if codesign -d --entitlements :- Payload/HouseCapture.app >/tmp/entitlements.plist 2>/tmp/codesign-before.txt; then
+            echo "Entitlements before stripping:"
+            cat /tmp/entitlements.plist
+          else
+            echo "No signature entitlements before stripping:"
+            cat /tmp/codesign-before.txt
+          fi
+          rm -rf Payload/HouseCapture.app/_CodeSignature
+          rm -f Payload/HouseCapture.app/embedded.mobileprovision
+          rm -rf Payload/HouseCapture.app/PlugIns Payload/HouseCapture.app/Extensions Payload/HouseCapture.app/Watch
+          if codesign -dv Payload/HouseCapture.app >/dev/null 2>&1; then
+            codesign --remove-signature Payload/HouseCapture.app
+          fi
+          rm -rf Payload/HouseCapture.app/_CodeSignature
+          if codesign -dv Payload/HouseCapture.app >/tmp/codesign.txt 2>&1; then
+            echo "Appen er stadig signeret:"
+            cat /tmp/codesign.txt
+            exit 1
+          fi
+          grep -q "not signed" /tmp/codesign.txt
+
+          if find Payload/HouseCapture.app -name '*.entitlements' -print | grep -q .; then
+            echo "Entitlements-fil ligger stadig i app-bundtet:"
+            find Payload/HouseCapture.app -name '*.entitlements' -print
+            exit 1
+          fi
+
+          INFO="Payload/HouseCapture.app/Info.plist"
+          plutil -extract CFBundleIdentifier raw "$INFO" | grep -qx "com.wesbos.housecapture"
+          plutil -extract CFBundleDisplayName raw "$INFO" | grep -qx "3D Model Anything"
+          plutil -extract NSCameraUsageDescription raw "$INFO" | grep -q "LiDAR"
+          for key in UIFileSharingEnabled LSSupportsOpeningDocumentsInPlace; do
+            value="$(plutil -extract "$key" raw "$INFO" | tr '[:upper:]' '[:lower:]')"
+            case "$value" in
+              true|yes|1) ;;
+              *) echo "Forventede at $key var true, men fik: $value"; exit 1 ;;
+            esac
+          done
+          echo "MinimumOSVersion: $(plutil -extract MinimumOSVersion raw "$INFO" 2>/dev/null || echo mangler)"
+          echo "Info.plist:"
+          plutil -p "$INFO"
+          vtool -show-build Payload/HouseCapture.app/HouseCapture || true
+          file Payload/HouseCapture.app/HouseCapture
+          lipo -info Payload/HouseCapture.app/HouseCapture
+
+          ditto -c -k --keepParent Payload HouseCapture.ipa
+          unzip -l HouseCapture.ipa
+          if unzip -l HouseCapture.ipa | grep -E 'data/|thumb-1|office'; then
+            echo "Demo-assets må ikke ligge i IPA'en"
+            exit 1
+          fi
+          ls -lh HouseCapture.ipa
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: HouseCapture-ipa
+          path: HouseCapture.ipa
+          if-no-files-found: error
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          NOTES="Usigneret HouseCapture.ipa (3D Model Anything) fra wesbos/3d-model-anything ${HOUSE_CAPTURE_REF}.
+
+          Stabil download uden login:
+          https://github.com/${GITHUB_REPOSITORY}/releases/download/house-capture-latest/HouseCapture.ipa
+
+          Denne build:
+          https://github.com/${GITHUB_REPOSITORY}/releases/download/house-capture-build-${GITHUB_RUN_NUMBER}/HouseCapture.ipa
+
+          MIT, Copyright (c) 2026 Wes Bos. Ingen App Groups, iCloud, push eller app-udvidelser er fjernet, fordi appen ikke bruger dem. Installer med SideStore."
+
+          delete_release() {
+            local tag="$1"
+            if gh release view "$tag" >/dev/null 2>&1; then
+              gh release delete "$tag" --yes --cleanup-tag || gh release delete "$tag" --yes || true
+            fi
+            gh api -X DELETE "repos/${GITHUB_REPOSITORY}/git/refs/tags/${tag}" >/dev/null 2>&1 || true
+          }
+
+          create_release() {
+            local tag="$1"
+            local title="$2"
+            delete_release "$tag"
+            local attempt
+            for attempt in 1 2 3 4 5; do
+              if gh release create "$tag" HouseCapture.ipa \
+                --prerelease \
+                --title "$title" \
+                --notes "$NOTES"; then
+                return 0
+              fi
+              delete_release "$tag"
+              sleep $((attempt * 2))
+            done
+            return 1
+          }
+
+          create_release "house-capture-build-${GITHUB_RUN_NUMBER}" "HouseCapture build ${GITHUB_RUN_NUMBER}"
+          create_release "house-capture-latest" "HouseCapture latest (${HOUSE_CAPTURE_REF:0:7})"
+          gh release view house-capture-latest --json tagName,assets,url
