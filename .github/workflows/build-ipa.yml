@@ -1,0 +1,157 @@
+name: Build unsigned IPA
+
+on:
+  push:
+    branches:
+      - main
+      - cursor/**
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: unsigned-ipa-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: macos-latest
+    timeout-minutes: 40
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Install XcodeGen
+        run: |
+          set -euo pipefail
+          curl -fsSL -o /tmp/xcodegen.zip "https://github.com/yonaskolb/XcodeGen/releases/download/2.46.0/xcodegen.zip"
+          rm -rf /tmp/xcodegen-dist
+          unzip -q /tmp/xcodegen.zip -d /tmp/xcodegen-dist
+          mkdir -p "$HOME/.local"
+          PREFIX="$HOME/.local" /tmp/xcodegen-dist/xcodegen/install.sh
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          "$HOME/.local/bin/xcodegen" --version
+
+      - name: Generate Xcode project
+        run: xcodegen generate
+
+      - name: Show toolchain
+        run: |
+          xcodebuild -version
+          xcodebuild -showsdks
+          xcodebuild -project Mini3DScan.xcodeproj -scheme Mini3DScan -showBuildSettings | grep -E "CODE_SIGN|PRODUCT_BUNDLE_IDENTIFIER|IPHONEOS_DEPLOYMENT_TARGET|SDKROOT" || true
+
+      - name: Build unsigned app
+        run: |
+          set -euo pipefail
+          xcodebuild \
+            -project Mini3DScan.xcodeproj \
+            -scheme Mini3DScan \
+            -configuration Release \
+            -destination "generic/platform=iOS" \
+            -sdk iphoneos \
+            -derivedDataPath "$GITHUB_WORKSPACE/build" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGN_ENTITLEMENTS="" \
+            DEVELOPMENT_TEAM="" \
+            AD_HOC_CODE_SIGNING_ALLOWED=NO \
+            build
+
+      - name: Package unsigned IPA
+        run: |
+          set -euo pipefail
+          APP="$GITHUB_WORKSPACE/build/Build/Products/Release-iphoneos/Mini3DScan.app"
+          test -d "$APP"
+          test -x "$APP/Mini3DScan"
+
+          rm -rf Payload Mini3DScan.ipa
+          mkdir Payload
+          cp -a "$APP" Payload/
+          rm -rf Payload/Mini3DScan.app/_CodeSignature
+          if [ -d Payload/Mini3DScan.app/_CodeSignature ] || codesign -dv Payload/Mini3DScan.app >/dev/null 2>&1; then
+            codesign --remove-signature Payload/Mini3DScan.app
+          fi
+          rm -rf Payload/Mini3DScan.app/_CodeSignature
+          rm -f Payload/Mini3DScan.app/embedded.mobileprovision
+
+          if codesign -dv Payload/Mini3DScan.app >/tmp/codesign.txt 2>&1; then
+            echo "Appen er stadig signeret:"
+            cat /tmp/codesign.txt
+            exit 1
+          fi
+          grep -q "not signed" /tmp/codesign.txt
+
+          INFO="Payload/Mini3DScan.app/Info.plist"
+          plutil -extract CFBundleIdentifier raw "$INFO" | grep -qx "dk.friborg.mini3dscan"
+          plutil -extract CFBundleDisplayName raw "$INFO" | grep -qx "Mini3DScan"
+          plutil -extract NSCameraUsageDescription raw "$INFO" | grep -q "LiDAR"
+          for key in UIFileSharingEnabled LSSupportsOpeningDocumentsInPlace; do
+            value="$(plutil -extract "$key" raw "$INFO" | tr '[:upper:]' '[:lower:]')"
+            case "$value" in
+              true|yes|1) ;;
+              *) echo "Forventede at $key var true, men fik: $value"; exit 1 ;;
+            esac
+          done
+          echo "Info.plist:"
+          plutil -p "$INFO"
+          file Payload/Mini3DScan.app/Mini3DScan
+          lipo -info Payload/Mini3DScan.app/Mini3DScan
+
+          ditto -c -k --keepParent Payload Mini3DScan.ipa
+          ls -lh Mini3DScan.ipa
+          unzip -l Mini3DScan.ipa | head -40
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: Mini3DScan-ipa
+          path: Mini3DScan.ipa
+          if-no-files-found: error
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          NOTES="Usigneret Mini3DScan.ipa fra build ${GITHUB_RUN_NUMBER} (${GITHUB_SHA}).
+
+          Stabil download uden login:
+          https://github.com/${GITHUB_REPOSITORY}/releases/download/latest/Mini3DScan.ipa
+
+          Denne build:
+          https://github.com/${GITHUB_REPOSITORY}/releases/download/build-${GITHUB_RUN_NUMBER}/Mini3DScan.ipa
+
+          Installer med SideStore. Se README."
+
+          delete_release() {
+            local tag="$1"
+            if gh release view "$tag" >/dev/null 2>&1; then
+              gh release delete "$tag" --yes --cleanup-tag || gh release delete "$tag" --yes || true
+            fi
+            gh api -X DELETE "repos/${GITHUB_REPOSITORY}/git/refs/tags/${tag}" >/dev/null 2>&1 || true
+          }
+
+          create_release() {
+            local tag="$1"
+            local title="$2"
+            delete_release "$tag"
+            local attempt
+            for attempt in 1 2 3 4 5; do
+              if gh release create "$tag" Mini3DScan.ipa \
+                --prerelease \
+                --title "$title" \
+                --notes "$NOTES"; then
+                return 0
+              fi
+              delete_release "$tag"
+              sleep $((attempt * 2))
+            done
+            return 1
+          }
+
+          create_release "build-${GITHUB_RUN_NUMBER}" "Mini3DScan build ${GITHUB_RUN_NUMBER}"
+          create_release "latest" "Mini3DScan latest (build ${GITHUB_RUN_NUMBER})"
+          gh release view latest --json tagName,assets,url

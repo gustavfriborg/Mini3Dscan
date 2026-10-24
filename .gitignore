@@ -1,0 +1,9 @@
+.DS_Store
+build/
+DerivedData/
+*.ipa
+Payload/
+*.xcodeproj
+*.xcworkspace
+xcuserdata/
+Mini3DScan/Info.plist
